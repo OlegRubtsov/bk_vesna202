@@ -1,0 +1,7 @@
+.pio/
+.pio-core/
+.vscode/
+*.bin
+!reference/bk0010.bin
+*.elf
+/include/secrets.h
