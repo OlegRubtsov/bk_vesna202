@@ -35,6 +35,7 @@
  *   https://github.com/platformio/platform-espressif32
  */
 #include <Arduino.h>
+#include <GyverButton.h>  // https://github.com/GyverLibs/GyverButton
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <Preferences.h>
@@ -43,6 +44,8 @@
 #include <DNSServer.h>
 #include <LittleFS.h>
 #include <esp32-hal-timer.h>
+#include <algorithm>
+#include <vector>
 
 // Подключение платы: OLED по I²C на GPIO 5/6, ленточный аудиовыход GPIO 8.
 // Confirmed wiring: large OLED on GPIO 5/6, audio/tape signal on GPIO 8.
@@ -57,6 +60,24 @@ size_t systemBinSize() {
 }
 
 constexpr uint8_t AUDIO_PIN = 8;
+// Все четыре кнопки замыкают вход на GND.
+GButton buttons[] = {GButton(0), GButton(1), GButton(2), GButton(3)};
+struct LocalBin {
+  String name;
+  int id;
+};
+std::vector<LocalBin> localBins;
+bool localBinsDirty = true;
+size_t selectedBin = 0;
+float savedSpeed = 1.0f;
+bool replaceTapeName = false, upperTapeName = false;
+String replacementName = "V";
+enum class MenuItem { Speed, Level, Replace, Upper };
+MenuItem menuItem = MenuItem::Speed;
+bool menuOpen = false, menuEditing = false;
+int menuDraft = 0;
+uint32_t menuRevision = 0;
+bool buttonPlayFailed = false;
 // Длительность элементарного сигнала БК при скорости 1x; ускорение делит это значение.
 constexpr uint32_t BASE_UNIT_US = 417; // Standard BK tape bit timing, about 1200 baud.
 constexpr uint8_t MAX_FILENAME = 16;
@@ -311,6 +332,8 @@ void drawProgressLine() {
   snprintf(line, sizeof(line), "DATA %3u%% ETA %02lu:%02lu", playbackPercent(),
            static_cast<unsigned long>(seconds / 60), static_cast<unsigned long>(seconds % 60));
   display.drawStr(6, 43, line);
+  display.drawFrame(6, 46, 116, 6);
+  display.drawBox(7, 47, 114 * playbackPercent() / 100, 4);
 }
 
 // Отдаёт состояние плеера веб-интерфейсу. Пароль Wi-Fi в JSON не включается.
@@ -324,6 +347,7 @@ void sendStatus() {
     "\",\"ip\":\"" + ip + "\",\"ap_ip\":\"" + (wifiApActive ? WiFi.softAPIP().toString() : "") +
     "\",\"ssid\":\"" + jsonEscape(currentSsid.c_str()) + "\",\"current_network\":\"" + jsonEscape(currentNetwork.c_str()) + "\",\"wifi_connected\":" + String(connected ? "true" : "false") +
     ",\"wifi_setup_required\":" + String(wifiSetupRequired ? "true" : "false") +
+    ",\"menu_revision\":" + String(menuRevision) +
     ",\"speed\":" + String(playbackSpeed, 1) + ",\"percent\":" + String(playbackPercent()) +
     ",\"remaining_seconds\":" + String(remainingSeconds()) + "}";
   server.send(200, "application/json; charset=utf-8", json);
@@ -345,9 +369,9 @@ textarea{display:block;background:#eef4ff;color:#101722;line-height:1.35;min-hei
 #fileEta{color:#45d483;white-space:nowrap;font-weight:700;font-variant-numeric:tabular-nums}
 .playing-selection .file-details{justify-content:flex-end}
 .playing-selection .file-meta{flex:0 1 auto;min-width:0;white-space:normal;text-align:right}
-</style><main><h1>Плеер БК0010...11М</h1><div class="player-row file-row"><label for="file">Файл BIN</label><div class="file-select-wrap"><select id="file" hidden></select><button id="filePickerButton" type="button" class="file-picker-button"><span id="fileDisplay" class="file-display"></span><span id="fileEta" hidden></span><span class="file-details"><span id="fileMeta" class="file-meta"></span><span id="filePin" class="file-pin" aria-hidden="true" hidden>&#128206;&#65038;</span><span class="file-chevron">&#9662;</span></span></button><div id="fileOptions" class="file-options" hidden></div></div></div><div class="player-row controls-row"><button id="play" onclick="playSelected()"><span aria-hidden="true">▶</span> Пуск</button><button id="stop" onclick="cmd('/stop')"><span aria-hidden="true">■</span> Стоп</button><input id="bin" type="file" accept=".bin"><label class="upload-file-btn" for="bin">Загрузить</label><button id="delete" onclick="deleteSelected()">Удалить</button><label for="speed">Скорость</label><select id="speed"><option value="1.0">1,0×</option><option value="1.5">1,5×</option><option value="2.0">2,0×</option><option value="2.5">2,5×</option><option value="3.0">3,0×</option></select></div><div class="name-options"><label class="protect-row"><input type="checkbox" id="overrideTapeName" onchange="document.getElementById('tapeName').disabled=!this.checked"> Заменить имя в заголовке ленты</label><input type="text" id="tapeName" maxlength="16" value="А" aria-label="Имя на ленте" disabled><label class="protect-row"><input type="checkbox" id="upperTapeName"> ЗАГЛАВНЫМИ</label></div><label class="protect-row"><input id="protectFile" type="checkbox" onchange="setProtected()"> Не удалять автоматически при загрузке новых BIN &#128206;&#65038;</label><label class="audio-level-row" for="audioLevel">Уровень сигнала <span id="audioLevelValue">100%</span><input id="audioLevel" type="range" min="0" max="100" value="100" oninput="showAudioLevel(this.value)" onchange="saveAudioLevel(this.value)"></label><span id="uploadResult"></span><div class="upload"><strong>Сохранённые ссылки</strong><div class="catalog-sort"><label class="catalog-search-label" for="catalogSearch">Поиск</label><input id="catalogSearch" type="search" placeholder="Имя файла или ссылка" oninput="renderCatalogLinks()"><label for="catalogSort">Сортировка</label><select id="catalogSort" onchange="renderCatalogLinks()"><option value="file">Как в файле</option><option value="alpha">По алфавиту</option></select></div><div class="catalog-picker-wrap"><select id="catalogFiles" hidden></select><button id="catalogPickerButton" type="button" class="catalog-picker-button"><span id="catalogDisplay"></span><span class="file-chevron">&#9662;</span></button><div id="catalogOptions" class="file-options" hidden></div></div><label for="remoteUrl">Ссылка на файл</label><textarea id="remoteUrl" rows="1" placeholder="Вставьте ссылку на BIN или ZIP" oninput="onManualUrlInput()" style="width:100%;margin:8px 0"></textarea><button id="remotePlay" onclick="playRemote()">Скачать и запустить</button><span id="remoteResult"></span><div id="zipPicker" hidden><label for="zipMember">Файл BIN в ZIP-архиве</label><select id="zipMember"></select><button id="extractZip" onclick="extractSelectedZip()">Распаковать и запустить</button><button onclick="cancelZip()" style="margin-left:18px">Отмена</button></div><div class="links-actions"><a class="link-button" href="/catalog_links.txt" download="catalog_links.txt">Скачать список ссылок</a><input id="linksText" type="file" onchange="uploadLinks()"><label class="link-button" for="linksText">Загрузить список ссылок</label></div><span id="linksResult"></span><p class="muted">Добавленные вручную ссылки сохранятся в списке. ZIP-архив распаковывается в браузере. Если BIN-файлов несколько, выберите нужный.</p></div><p id="lengthWarning" role="status" style="color:#e4bd55" hidden></p><div class="status" id="status">Подключение...</div><p class="muted" id="storage">Память: проверка...</p><button type="button" class="wifi-settings-button" onclick="openWifiDialog()">Настройки Wi-Fi</button><dialog id="wifiDialog"><h2>Подключение к Wi-Fi</h2><p id="currentWifi" class="muted">Current network: checking...</p><label for="wifiSsid">Имя сети (SSID)</label><input id="wifiSsid" autocomplete="off"><label for="wifiPassword">Пароль</label><input id="wifiPassword" type="password" autocomplete="new-password"><p id="wifiMessage" class="muted"></p><div class="dialog-actions"><button type="button" onclick="connectWifi()">Подключиться</button><button type="button" onclick="closeWifiDialog()">Закрыть</button></div></dialog></main><script>
+</style><main><h1>Плеер БК0010...11М</h1><div class="player-row file-row"><label for="file">Файл BIN</label><div class="file-select-wrap"><select id="file" hidden></select><button id="filePickerButton" type="button" class="file-picker-button"><span id="fileDisplay" class="file-display"></span><span id="fileEta" hidden></span><span class="file-details"><span id="fileMeta" class="file-meta"></span><span id="filePin" class="file-pin" aria-hidden="true" hidden>&#128206;&#65038;</span><span class="file-chevron">&#9662;</span></span></button><div id="fileOptions" class="file-options" hidden></div></div></div><div class="player-row controls-row"><button id="play" onclick="playSelected()"><span aria-hidden="true">▶</span> Пуск</button><button id="stop" onclick="cmd('/stop')"><span aria-hidden="true">■</span> Стоп</button><input id="bin" type="file" accept=".bin"><label class="upload-file-btn" for="bin">Загрузить</label><button id="delete" onclick="deleteSelected()">Удалить</button><label for="speed">Скорость</label><select id="speed"><option value="1.0">1,0×</option><option value="1.5">1,5×</option><option value="2.0">2,0×</option><option value="2.5">2,5×</option><option value="3.0">3,0×</option></select></div><div class="name-options"><label class="protect-row"><input type="checkbox" id="overrideTapeName" onchange="document.getElementById('tapeName').disabled=!this.checked"> Заменить имя в заголовке ленты</label><input type="text" id="tapeName" maxlength="16" value="V" aria-label="Имя на ленте" disabled><label class="protect-row"><input type="checkbox" id="upperTapeName"> ЗАГЛАВНЫМИ</label></div><label class="protect-row"><input id="protectFile" type="checkbox" onchange="setProtected()"> Не удалять автоматически при загрузке новых BIN &#128206;&#65038;</label><label class="audio-level-row" for="audioLevel">Уровень сигнала <span id="audioLevelValue">100%</span><input id="audioLevel" type="range" min="0" max="100" value="100" oninput="showAudioLevel(this.value)" onchange="saveAudioLevel(this.value)"></label><span id="uploadResult"></span><div class="upload"><strong>Сохранённые ссылки</strong><div class="catalog-sort"><label class="catalog-search-label" for="catalogSearch">Поиск</label><input id="catalogSearch" type="search" placeholder="Имя файла или ссылка" oninput="renderCatalogLinks()"><label for="catalogSort">Сортировка</label><select id="catalogSort" onchange="renderCatalogLinks()"><option value="file">Как в файле</option><option value="alpha">По алфавиту</option></select></div><div class="catalog-picker-wrap"><select id="catalogFiles" hidden></select><button id="catalogPickerButton" type="button" class="catalog-picker-button"><span id="catalogDisplay"></span><span class="file-chevron">&#9662;</span></button><div id="catalogOptions" class="file-options" hidden></div></div><label for="remoteUrl">Ссылка на файл</label><textarea id="remoteUrl" rows="1" placeholder="Вставьте ссылку на BIN или ZIP" oninput="onManualUrlInput()" style="width:100%;margin:8px 0"></textarea><button id="remotePlay" onclick="playRemote()">Скачать и запустить</button><span id="remoteResult"></span><div id="zipPicker" hidden><label for="zipMember">Файл BIN в ZIP-архиве</label><select id="zipMember"></select><button id="extractZip" onclick="extractSelectedZip()">Распаковать и запустить</button><button onclick="cancelZip()" style="margin-left:18px">Отмена</button></div><div class="links-actions"><a class="link-button" href="/catalog_links.txt" download="catalog_links.txt">Скачать список ссылок</a><input id="linksText" type="file" onchange="uploadLinks()"><label class="link-button" for="linksText">Загрузить список ссылок</label></div><span id="linksResult"></span><p class="muted">Добавленные вручную ссылки сохранятся в списке. ZIP-архив распаковывается в браузере. Если BIN-файлов несколько, выберите нужный.</p></div><p id="lengthWarning" role="status" style="color:#e4bd55" hidden></p><div class="status" id="status">Подключение...</div><p class="muted" id="storage">Память: проверка...</p><button type="button" class="wifi-settings-button" onclick="openWifiDialog()">Настройки Wi-Fi</button><dialog id="wifiDialog"><h2>Подключение к Wi-Fi</h2><p id="currentWifi" class="muted">Current network: checking...</p><label for="wifiSsid">Имя сети (SSID)</label><input id="wifiSsid" autocomplete="off"><label for="wifiPassword">Пароль</label><input id="wifiPassword" type="password" autocomplete="new-password"><p id="wifiMessage" class="muted"></p><div class="dialog-actions"><button type="button" onclick="connectWifi()">Подключиться</button><button type="button" onclick="closeWifiDialog()">Закрыть</button></div></dialog></main><script>
 // Связывает элементы интерфейса со списками BIN и синхронизирует выбор с API устройства.
-const file=document.querySelector('#file'),speed=document.querySelector('#speed'),status=document.querySelector('#status'),fileWrap=document.querySelector('.file-select-wrap'),fileOptions=document.querySelector('#fileOptions'),filePin=document.querySelector('#filePin'),fileDisplay=document.querySelector('#fileDisplay'),fileMeta=document.querySelector('#fileMeta'),protectBox=document.querySelector('#protectFile');document.querySelector('#bin').onchange=uploadBin;speed.onchange=()=>loadFiles(file.selectedOptions[0]?.textContent||'');function showAudioLevel(value){document.querySelector('#audioLevelValue').textContent=value+'%'}async function saveAudioLevel(value){showAudioLevel(value);try{const response=await fetch('/audio-level?value='+encodeURIComponent(value),{method:'POST'});if(!response.ok)throw Error(await response.text())}catch(e){document.querySelector('#uploadResult').textContent='Could not save audio level: '+e.message}}async function loadAudioLevel(){try{const response=await fetch('/api/audio-level');if(!response.ok)return;const value=Number(await response.text());document.querySelector('#audioLevel').value=value;showAudioLevel(value)}catch(e){}}let filePinState=[],fileNames=[],fileInfo=[];const paperclip=String.fromCodePoint(0x1F4CE)+String.fromCharCode(0xFE0E);function cleanFileLabel(s){return s.trim()}let activeBinName='', activeBinPercent=0, activeRemainingSeconds=0;
+const file=document.querySelector('#file'),speed=document.querySelector('#speed'),status=document.querySelector('#status'),fileWrap=document.querySelector('.file-select-wrap'),fileOptions=document.querySelector('#fileOptions'),filePin=document.querySelector('#filePin'),fileDisplay=document.querySelector('#fileDisplay'),fileMeta=document.querySelector('#fileMeta'),protectBox=document.querySelector('#protectFile');document.querySelector('#bin').onchange=uploadBin;speed.onchange=async()=>{await saveControl('speed',speed.value);await loadFiles(file.selectedOptions[0]?.textContent||'')};function showAudioLevel(value){document.querySelector('#audioLevelValue').textContent=value+'%'}async function saveAudioLevel(value){showAudioLevel(value);try{const response=await fetch('/audio-level?value='+encodeURIComponent(value),{method:'POST'});if(!response.ok)throw Error(await response.text())}catch(e){document.querySelector('#uploadResult').textContent='Could not save audio level: '+e.message}}async function loadAudioLevel(){try{const response=await fetch('/api/audio-level');if(!response.ok)return;const value=Number(await response.text());document.querySelector('#audioLevel').value=value;showAudioLevel(value)}catch(e){}}let filePinState=[],fileNames=[],fileInfo=[];const paperclip=String.fromCodePoint(0x1F4CE)+String.fromCharCode(0xFE0E);function cleanFileLabel(s){return s.trim()}let activeBinName='', activeBinPercent=0, activeRemainingSeconds=0;
 function updateFileProgress(){
   const selectedName=file.selectedOptions[0]?.textContent;
   const playing=Boolean(activeBinName && selectedName===activeBinName);
@@ -358,17 +382,34 @@ function updateFileProgress(){
   document.querySelector('#filePickerButton').classList.toggle('playing-selection',playing);
   document.querySelector('#filePickerButton').style.setProperty('--played',percent+'%');
 }
-function updatePinIcon(){updateFileProgress();const option=file.selectedOptions[0],index=option?Number(option.value):-1;fileDisplay.textContent=option?option.textContent+(fileInfo[index]?.system?' *':''):'';const info=fileInfo[index]||{};fileMeta.textContent=option?Number(info.size||0).toLocaleString()+' B · ~'+formatFileTime(Number(info.duration_seconds||0)):'';filePin.hidden=index<0||!filePinState[index]}function updateDelete(){document.querySelector('#delete').disabled=!file.selectedOptions[0];updatePinIcon()}function formatFileTime(seconds){return Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')}function renderFilePicker(){fileOptions.replaceChildren();fileNames.forEach((name,i)=>{const row=document.createElement('button');row.type='button';row.className='file-option';row.setAttribute('aria-selected',String(file.value===String(i)));const label=document.createElement('span');label.className='file-option-name';label.textContent=name+(fileInfo[i]?.system?' *':'');row.append(label);const meta=document.createElement('span');meta.className='file-option-meta';const info=fileInfo[i]||{};meta.textContent=Number(info.size||0).toLocaleString()+' B · ~'+formatFileTime(Number(info.duration_seconds||0));row.append(meta);if(filePinState[i]){const icon=document.createElement('span');icon.className='file-option-pin';icon.textContent=paperclip;icon.setAttribute('aria-label','Protected from automatic deletion');row.append(icon)}row.onclick=()=>{file.value=String(i);fileOptions.hidden=true;file.dispatchEvent(new Event('change'))};fileOptions.append(row)})}document.querySelector('#filePickerButton').onclick=()=>{fileOptions.hidden=!fileOptions.hidden};document.addEventListener('click',e=>{if(!fileWrap.contains(e.target))fileOptions.hidden=true});async function loadFiles(selectName=''){let selectedName=file.selectedOptions[0]?.textContent||'';file.replaceChildren();const entries=(await(await fetch('/api/files?speed='+encodeURIComponent(speed.value))).json()).map((entry,index)=>({...entry,id:entry.id??index})).sort((a,b)=>a.name.localeCompare(b.name,'ru',{sensitivity:'base',numeric:true}));fileInfo=entries;fileNames=entries.map(x=>x.name);filePinState=entries.map(x=>x.protected);entries.forEach((x,i)=>file.add(new Option(x.name,i)));if(selectName){const found=entries.findIndex(x=>x.name.toLowerCase()===selectName.toLowerCase());if(found>=0)file.value=String(found)}else if(selectedName){const found=entries.findIndex(x=>x.name.toLowerCase()===selectedName.toLowerCase());if(found>=0)file.value=String(found)}renderFilePicker();updateDelete();refreshProtection()}file.onchange=()=>{renderFilePicker();updateDelete();refreshProtection();persistSelections()};function selectedFileServerId(){const entry=fileInfo[Number(file.value)];return entry?entry.id:-1}function playbackUrl(id){
-  const params = new URLSearchParams({id, speed: speed.value});
-  if (document.querySelector('#overrideTapeName').checked)
-    params.set('name', document.querySelector('#tapeName').value.trim());
-  if (document.querySelector('#upperTapeName').checked) params.set('upper', '1');
-  return '/play?' + params;
+function updatePinIcon(){updateFileProgress();const option=file.selectedOptions[0],index=option?Number(option.value):-1;fileDisplay.textContent=option?option.textContent+(fileInfo[index]?.system?' *':''):'';const info=fileInfo[index]||{};fileMeta.textContent=option?Number(info.size||0).toLocaleString()+' B · ~'+formatFileTime(Number(info.duration_seconds||0)):'';filePin.hidden=index<0||!filePinState[index]}function updateDelete(){document.querySelector('#delete').disabled=!file.selectedOptions[0];updatePinIcon()}function formatFileTime(seconds){return Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')}function renderFilePicker(){fileOptions.replaceChildren();fileNames.forEach((name,i)=>{const row=document.createElement('button');row.type='button';row.className='file-option';row.setAttribute('aria-selected',String(file.value===String(i)));const label=document.createElement('span');label.className='file-option-name';label.textContent=name+(fileInfo[i]?.system?' *':'');row.append(label);const meta=document.createElement('span');meta.className='file-option-meta';const info=fileInfo[i]||{};meta.textContent=Number(info.size||0).toLocaleString()+' B · ~'+formatFileTime(Number(info.duration_seconds||0));row.append(meta);if(filePinState[i]){const icon=document.createElement('span');icon.className='file-option-pin';icon.textContent=paperclip;icon.setAttribute('aria-label','Protected from automatic deletion');row.append(icon)}row.onclick=()=>{file.value=String(i);fileOptions.hidden=true;file.dispatchEvent(new Event('change'))};fileOptions.append(row)})}document.querySelector('#filePickerButton').onclick=()=>{fileOptions.hidden=!fileOptions.hidden};document.addEventListener('click',e=>{if(!fileWrap.contains(e.target))fileOptions.hidden=true});async function loadFiles(selectName=''){let selectedName=file.selectedOptions[0]?.textContent||'';file.replaceChildren();const entries=(await(await fetch('/api/files?speed='+encodeURIComponent(speed.value))).json()).map((entry,index)=>({...entry,id:entry.id??index})).sort((a,b)=>a.name.localeCompare(b.name,'ru',{sensitivity:'base',numeric:true}));fileInfo=entries;fileNames=entries.map(x=>x.name);filePinState=entries.map(x=>x.protected);entries.forEach((x,i)=>file.add(new Option(x.name,i)));if(selectName){const found=entries.findIndex(x=>x.name.toLowerCase()===selectName.toLowerCase());if(found>=0)file.value=String(found)}else if(selectedName){const found=entries.findIndex(x=>x.name.toLowerCase()===selectedName.toLowerCase());if(found>=0)file.value=String(found)}renderFilePicker();updateDelete();refreshProtection()}file.onchange=()=>{renderFilePicker();updateDelete();refreshProtection();persistSelections()};function selectedFileServerId(){const entry=fileInfo[Number(file.value)];return entry?entry.id:-1}let menuRevisionSeen = -1;
+let pendingSetting = Promise.resolve();
+function saveControl(key, value) {
+  pendingSetting = pendingSetting.catch(()=>{}).then(async()=>{
+    const result = await fetch('/selection?' + new URLSearchParams({[key]:value}));
+    if (!result.ok) throw Error(await result.text());
+  });
+  pendingSetting.catch(error=>document.querySelector('#uploadResult').textContent=error.message);
+  return pendingSetting;
 }
-function playSelected(){const id=selectedFileServerId();if(id>=0)cmd(playbackUrl(id))}async function refreshProtection(){const option=file.selectedOptions[0];protectBox.disabled=!option;if(!option){protectBox.checked=false;updatePinIcon();return}try{const info=await(await fetch('/api/protect?id='+selectedFileServerId())).json();protectBox.checked=info.protected;filePinState[Number(file.value)]=info.protected}catch(e){protectBox.checked=false}renderFilePicker();updatePinIcon()}async function setProtected(){if(fileInfo[Number(file.value)]?.system){protectBox.checked=true;alert("This is a system file and cannot be deleted.");return}const index=Number(file.value),serverId=selectedFileServerId(),keep=protectBox.checked,response=await fetch('/protect?id='+serverId+'&keep='+(keep?'1':'0'));if(response.ok){filePinState[index]=keep;renderFilePicker();updatePinIcon()}else await refreshProtection()}async function deleteSelected(){if(!confirm('Delete selected BIN file?'))return;let r=await fetch('/delete?id='+selectedFileServerId());document.querySelector('#uploadResult').textContent=await r.text();if(r.ok){await loadFiles();await persistSelections();refreshStorage()}}let catalogLinkData=[],remoteBusy=false,pendingZip=null;let manualRemoteUrl=false,manualLinkName="",manualLinkUrl="";function renderCatalogPicker(){const select=document.querySelector('#catalogFiles'),options=document.querySelector('#catalogOptions'),display=document.querySelector('#catalogDisplay');options.replaceChildren();for(const opt of select.options){const isManual=opt.value==='manual',entry=isManual?{line:0,name:manualLinkName,url:manualLinkUrl}:catalogLinkData[Number(opt.value)];if(!entry)continue;const row=document.createElement('button');row.type='button';row.className='file-option catalog-option';row.setAttribute('aria-selected',String(select.value===opt.value));if(entry.line){const line=document.createElement('span');line.className='catalog-option-number';line.textContent=entry.line+': ';row.append(line)}const name=document.createElement('span');name.className='catalog-option-name';name.textContent=entry.name;row.append(name);row.onclick=()=>{select.value=opt.value;options.hidden=true;if(isManual){document.querySelector('#remoteUrl').value=manualLinkUrl;resizeRemoteUrl();manualRemoteUrl=true;renderCatalogPicker()}else selectCatalogLink(true)};options.append(row)}const selected=select.value==='manual'?{line:0,name:manualLinkName}:catalogLinkData[Number(select.value)];display.replaceChildren();if(selected){if(selected.line){const line=document.createElement('span');line.className='catalog-display-number';line.textContent=selected.line+': ';display.append(line)}const name=document.createElement('span');name.className='catalog-display-name';name.textContent=selected.name;display.append(name)}}document.querySelector('#catalogPickerButton').onclick=()=>{const options=document.querySelector('#catalogOptions');options.hidden=!options.hidden};document.addEventListener('click',e=>{if(!document.querySelector('.catalog-picker-wrap').contains(e.target))document.querySelector('#catalogOptions').hidden=true});function renderCatalogLinks(preferredUrl=''){const select=document.querySelector('#catalogFiles'),old=select.value,query=(document.querySelector('#catalogSearch')?.value||'').trim().toLocaleLowerCase(),order=catalogLinkData.map((_,i)=>i).filter(i=>!query||catalogLinkData[i].name.toLocaleLowerCase().includes(query)||catalogLinkData[i].url.toLocaleLowerCase().includes(query));if(document.querySelector('#catalogSort').value==='alpha')order.sort((a,b)=>catalogLinkData[a].name.localeCompare(catalogLinkData[b].name,undefined,{sensitivity:'base'}));select.replaceChildren();order.forEach(i=>select.add(new Option(catalogLinkData[i].name,String(i))));const preferred=preferredUrl?catalogLinkData.findIndex(x=>x.url===preferredUrl):-1;if(preferred>=0&&order.includes(preferred))select.value=String(preferred);else if(old&&order.includes(Number(old)))select.value=old;else if(order.length)select.value=String(order[0]);renderCatalogPicker();if(order.length)selectCatalogLink(false)}async function loadCatalogLinks(preferredUrl=''){try{catalogLinkData=await(await fetch('/api/catalog-links')).json();renderCatalogLinks(preferredUrl)}catch(e){document.querySelector('#linksResult').textContent='Saved catalog links are unavailable'}}async function persistSelections(){const name=file.selectedOptions[0]?.textContent||'',item=catalogLinkData[Number(document.querySelector('#catalogFiles').value)],url=item?item.url:'';await fetch('/selection?file='+encodeURIComponent(name)+'&catalog='+encodeURIComponent(url))}function selectCatalogLink(persist=true){const item=catalogLinkData[Number(document.querySelector('#catalogFiles').value)];if(item){document.querySelector('#remoteUrl').value=item.url;onManualUrlInput(false);manualRemoteUrl=false;renderCatalogPicker();if(persist)persistSelections()}}async function uploadLinks(){const input=document.querySelector('#linksText'),message=document.querySelector('#linksResult'),selected=input.files[0];if(!selected)return;if(!selected.name.toLowerCase().endsWith('.txt')){message.textContent='Choose a TXT file';return}try{const body=new FormData();body.append('file',selected,selected.name);const response=await fetch('/catalog-links',{method:'POST',body});message.textContent=await response.text();if(response.ok){input.value='';await loadCatalogLinks()}}catch(e){message.textContent='Could not upload catalog_links.txt'}}function unwrapCatalogInput(input){const value=input.trim(),match=value.match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);return match?match[1]:value}function catalogRawUrl(input){let url=unwrapCatalogInput(input).replace(/[.,;!?]+$/,'');const pages='https://kalininskiy.github.io/bk-catalog/';if(url.startsWith(pages))url='https://raw.githubusercontent.com/kalininskiy/bk-catalog/main/'+url.substring(pages.length);else if(url.startsWith('https://github.com/kalininskiy/bk-catalog/blob/main/'))url='https://raw.githubusercontent.com/kalininskiy/bk-catalog/main/'+url.substring('https://github.com/kalininskiy/bk-catalog/blob/main/'.length);return url}// Разбирает якорь карточки каталога вида #software-ID и выбирает JSON-набор нужного раздела.
+const replaceBox = document.querySelector('#overrideTapeName');
+const tapeInput = document.querySelector('#tapeName');
+const upperBox = document.querySelector('#upperTapeName');
+replaceBox.onchange = ()=>{tapeInput.disabled=!replaceBox.checked;saveControl('replace', Number(replaceBox.checked))};
+tapeInput.onchange = ()=>saveControl('tape_name', tapeInput.value);
+upperBox.onchange = ()=>saveControl('upper', Number(upperBox.checked));
+function applySavedControls(data) {
+  speed.value=Number(data.speed).toFixed(1);
+  replaceBox.checked=data.replace;
+  tapeInput.disabled=!data.replace;
+  if(document.activeElement!==tapeInput) tapeInput.value=data.name;
+  upperBox.checked=data.upper;
+  menuRevisionSeen=data.menu_revision;
+}
+async function playbackUrl(id){await pendingSetting;return '/play?id='+encodeURIComponent(id)}async function playSelected(){const id=selectedFileServerId();if(id>=0)cmd(await playbackUrl(id))}async function refreshProtection(){const option=file.selectedOptions[0];protectBox.disabled=!option;if(!option){protectBox.checked=false;updatePinIcon();return}try{const info=await(await fetch('/api/protect?id='+selectedFileServerId())).json();protectBox.checked=info.protected;filePinState[Number(file.value)]=info.protected}catch(e){protectBox.checked=false}renderFilePicker();updatePinIcon()}async function setProtected(){if(fileInfo[Number(file.value)]?.system){protectBox.checked=true;alert("This is a system file and cannot be deleted.");return}const index=Number(file.value),serverId=selectedFileServerId(),keep=protectBox.checked,response=await fetch('/protect?id='+serverId+'&keep='+(keep?'1':'0'));if(response.ok){filePinState[index]=keep;renderFilePicker();updatePinIcon()}else await refreshProtection()}async function deleteSelected(){if(!confirm('Delete selected BIN file?'))return;let r=await fetch('/delete?id='+selectedFileServerId());document.querySelector('#uploadResult').textContent=await r.text();if(r.ok){await loadFiles();await persistSelections();refreshStorage()}}let catalogLinkData=[],remoteBusy=false,pendingZip=null;let manualRemoteUrl=false,manualLinkName="",manualLinkUrl="";function renderCatalogPicker(){const select=document.querySelector('#catalogFiles'),options=document.querySelector('#catalogOptions'),display=document.querySelector('#catalogDisplay');options.replaceChildren();for(const opt of select.options){const isManual=opt.value==='manual',entry=isManual?{line:0,name:manualLinkName,url:manualLinkUrl}:catalogLinkData[Number(opt.value)];if(!entry)continue;const row=document.createElement('button');row.type='button';row.className='file-option catalog-option';row.setAttribute('aria-selected',String(select.value===opt.value));if(entry.line){const line=document.createElement('span');line.className='catalog-option-number';line.textContent=entry.line+': ';row.append(line)}const name=document.createElement('span');name.className='catalog-option-name';name.textContent=entry.name;row.append(name);row.onclick=()=>{select.value=opt.value;options.hidden=true;if(isManual){document.querySelector('#remoteUrl').value=manualLinkUrl;resizeRemoteUrl();manualRemoteUrl=true;renderCatalogPicker()}else selectCatalogLink(true)};options.append(row)}const selected=select.value==='manual'?{line:0,name:manualLinkName}:catalogLinkData[Number(select.value)];display.replaceChildren();if(selected){if(selected.line){const line=document.createElement('span');line.className='catalog-display-number';line.textContent=selected.line+': ';display.append(line)}const name=document.createElement('span');name.className='catalog-display-name';name.textContent=selected.name;display.append(name)}}document.querySelector('#catalogPickerButton').onclick=()=>{const options=document.querySelector('#catalogOptions');options.hidden=!options.hidden};document.addEventListener('click',e=>{if(!document.querySelector('.catalog-picker-wrap').contains(e.target))document.querySelector('#catalogOptions').hidden=true});function renderCatalogLinks(preferredUrl=''){const select=document.querySelector('#catalogFiles'),old=select.value,query=(document.querySelector('#catalogSearch')?.value||'').trim().toLocaleLowerCase(),order=catalogLinkData.map((_,i)=>i).filter(i=>!query||catalogLinkData[i].name.toLocaleLowerCase().includes(query)||catalogLinkData[i].url.toLocaleLowerCase().includes(query));if(document.querySelector('#catalogSort').value==='alpha')order.sort((a,b)=>catalogLinkData[a].name.localeCompare(catalogLinkData[b].name,undefined,{sensitivity:'base'}));select.replaceChildren();order.forEach(i=>select.add(new Option(catalogLinkData[i].name,String(i))));const preferred=preferredUrl?catalogLinkData.findIndex(x=>x.url===preferredUrl):-1;if(preferred>=0&&order.includes(preferred))select.value=String(preferred);else if(old&&order.includes(Number(old)))select.value=old;else if(order.length)select.value=String(order[0]);renderCatalogPicker();if(order.length)selectCatalogLink(false)}async function loadCatalogLinks(preferredUrl=''){try{catalogLinkData=await(await fetch('/api/catalog-links')).json();renderCatalogLinks(preferredUrl)}catch(e){document.querySelector('#linksResult').textContent='Saved catalog links are unavailable'}}async function persistSelections(){const name=file.selectedOptions[0]?.textContent||'',item=catalogLinkData[Number(document.querySelector('#catalogFiles').value)],url=item?item.url:'';await fetch('/selection?file='+encodeURIComponent(name)+'&catalog='+encodeURIComponent(url))}function selectCatalogLink(persist=true){const item=catalogLinkData[Number(document.querySelector('#catalogFiles').value)];if(item){document.querySelector('#remoteUrl').value=item.url;onManualUrlInput(false);manualRemoteUrl=false;renderCatalogPicker();if(persist)persistSelections()}}async function uploadLinks(){const input=document.querySelector('#linksText'),message=document.querySelector('#linksResult'),selected=input.files[0];if(!selected)return;if(!selected.name.toLowerCase().endsWith('.txt')){message.textContent='Choose a TXT file';return}try{const body=new FormData();body.append('file',selected,selected.name);const response=await fetch('/catalog-links',{method:'POST',body});message.textContent=await response.text();if(response.ok){input.value='';await loadCatalogLinks()}}catch(e){message.textContent='Could not upload catalog_links.txt'}}function unwrapCatalogInput(input){const value=input.trim(),match=value.match(/^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/i);return match?match[1]:value}function catalogRawUrl(input){let url=unwrapCatalogInput(input).replace(/[.,;!?]+$/,'');const pages='https://kalininskiy.github.io/bk-catalog/';if(url.startsWith(pages))url='https://raw.githubusercontent.com/kalininskiy/bk-catalog/main/'+url.substring(pages.length);else if(url.startsWith('https://github.com/kalininskiy/bk-catalog/blob/main/'))url='https://raw.githubusercontent.com/kalininskiy/bk-catalog/main/'+url.substring('https://github.com/kalininskiy/bk-catalog/blob/main/'.length);return url}// Разбирает якорь карточки каталога вида #software-ID и выбирает JSON-набор нужного раздела.
 function isBinZipUrl(input){try{const parsed=new URL(input);return (parsed.protocol==='http:'||parsed.protocol==='https:')&&/\.(bin|zip)$/i.test(parsed.pathname)}catch(e){return false}}function parseCatalogPageUrl(input){try{const page=new URL(unwrapCatalogInput(input));if(page.protocol!=='http:'&&page.protocol!=='https:')return null;if(isBinZipUrl(page.href))return null;const isBkCatalog=page.origin==='https://kalininskiy.github.io'&&page.pathname.replace(/\/+$/,'')==='/bk-catalog';const match=isBkCatalog?page.hash.match(/^#(game|games|software|demoscene)-(\d+)$/i):null;if(match){const section=match[1].toLowerCase();return{category:section==='game'?'games':section,id:Number(match[2]),url:page.href}}return{url:page.href}}catch(e){return null}}// Находит запись по ID, извлекает поля «Имя файла N» и оставляет только BIN/ZIP каталога.
 async function getBkCatalogPageFiles(page){const source='https://raw.githubusercontent.com/kalininskiy/bk-catalog/main/content/'+page.category+'.json',response=await fetch(source);if(!response.ok)throw Error('Could not load catalog data: HTTP '+response.status);const rows=await response.json(),record=rows.find(item=>Number(item.ID)===page.id);if(!record)throw Error('Catalog entry '+page.id+' was not found');const files=[],seen=new Set();for(let i=1;i<=5;i++){const value=record['Имя файла '+i];if(typeof value!=='string'||!value.trim())continue;const url=catalogRawUrl(value.trim()),path=url.toLowerCase().split('?')[0];if(!allowedCatalogDownloadUrl(url)||seen.has(url))continue;let name=record['Описание файла '+i];if(typeof name!=='string'||!name.trim()||name.includes('/')||name.includes('\\'))name=decodeURIComponent(path.split('/').pop());else name=name.trim();if(name.length>180)name=decodeURIComponent(path.split('/').pop());files.push({url,name});seen.add(url)}if(!files.length)throw Error('This catalog entry has no downloadable BIN/ZIP files');return files}async function getGenericPageFiles(page){const response=await fetch(page.url,{cache:'no-store'});if(!response.ok)throw Error('Could not load page: HTTP '+response.status);const html=await response.text(),doc=new DOMParser().parseFromString(html,'text/html'),files=[],seen=new Set(),candidates=[];for(const anchor of doc.querySelectorAll('a[href]'))candidates.push({value:anchor.getAttribute('href'),label:(anchor.textContent||'').trim()});for(const match of html.matchAll(/https?:\/\/[^\s"'<>]+?\.(?:bin|zip)(?:[?#][^\s"'<>]*)?/gi))candidates.push({value:match[0],label:''});for(const candidate of candidates){let url;try{url=new URL(candidate.value.replaceAll('\\/','/'),page.url).href}catch(e){continue}url=catalogRawUrl(url);if(!allowedCatalogDownloadUrl(url)||seen.has(url))continue;let name=candidate.label;if(!name||name.length>180||name.includes('/')||name.includes('\\')){try{name=decodeURIComponent(new URL(url).pathname.split('/').pop())}catch(e){name=new URL(url).pathname.split('/').pop()}}files.push({url,name});seen.add(url)}if(!files.length)throw Error('No BIN or ZIP links found on this page');return files}function allowedCatalogDownloadUrl(input){return isBinZipUrl(input)&&/^https?:\/\//i.test(input)}async function getCatalogPageFiles(page){return page.category?getBkCatalogPageFiles(page):getGenericPageFiles(page)}// Сохраняет найденные файлы в локальный список; один файл сразу запускает, несколько предлагает выбрать.
-async function importCatalogPage(page){const message=document.querySelector('#remoteResult'),button=document.querySelector('#remotePlay');remoteBusy=true;button.disabled=true;message.textContent='Reading files from the catalog entry...';try{const files=await getCatalogPageFiles(page);let saved=0;for(const item of files){const response=await fetch('/catalog-link/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({url:item.url,name:item.name})});if(response.ok)saved++;else throw Error(await response.text())}await loadCatalogLinks(files[0].url);if(files.length===1){document.querySelector('#remoteUrl').value=files[0].url;onManualUrlInput(false);manualRemoteUrl=false;message.textContent='Catalog file found. Downloading...';await playRemote()}else message.textContent='Found '+files.length+' files ('+saved+' saved). Choose one in Saved catalog links, then press Download and run.'}catch(e){message.textContent='Could not read files from catalog page: '+e.message}finally{remoteBusy=false;button.disabled=false}}async function uploadAndPlay(blob,name){if(blob.size<5||blob.size>65539)throw Error('BIN file size must be 5 to 65539 bytes');if(!name.toLowerCase().endsWith('.bin'))name+='.bin';const data=new FormData();data.append('file',new File([blob],name,{type:'application/octet-stream'}));const uploaded=await fetch('/upload',{method:'POST',body:data}),uploadMessage=await uploaded.text();if(!uploaded.ok)throw Error(uploadMessage);await loadFiles(name);await persistSelections();await refreshStorage();const names=await(await fetch('/api/files')).json(),id=names.findIndex(n=>n.name.toLowerCase()===name.toLowerCase());if(id<0)throw Error('Uploaded file was not found in the list');await loadFiles(name);const selectedId=selectedFileServerId();const started=await fetch(playbackUrl(selectedId));if(!started.ok)throw Error(await started.text());messageFor('Downloaded and playing: '+name);refresh()}function resizeRemoteUrl(){const input=document.querySelector('#remoteUrl');input.style.height='auto';input.style.height=Math.min(220,Math.max(42,input.scrollHeight))+'px'}function onManualUrlInput(manual=true){resizeRemoteUrl();manualRemoteUrl=manual;const original=document.querySelector('#remoteUrl').value.trim(),page=parseCatalogPageUrl(original);let value=unwrapCatalogInput(original).split(/[?#]/)[0];while(value.endsWith('/'))value=value.slice(0,-1);let name=page?(page.id?'Catalog item '+page.id:'Web page'):value.slice(value.lastIndexOf('/')+1);try{if(!page)name=decodeURIComponent(name)}catch(e){}manualLinkName=name;manualLinkUrl=original;const select=document.querySelector('#catalogFiles'),old=select.querySelector('option[value="manual"]');if(manual&&name){if(!old)select.add(new Option(name,'manual'));else old.textContent=name;select.value='manual'}else if(old){old.remove();if(select.value==='manual'&&select.options.length)select.value=select.options[0].value}renderCatalogPicker()}function messageFor(s){document.querySelector('#remoteResult').textContent=s}function zipEndOffset(bytes){const view=new DataView(bytes),start=Math.max(0,bytes.byteLength-65557);for(let i=bytes.byteLength-22;i>=start;i--)if(view.getUint32(i,true)===0x06054b50)return i;return -1}// Decodes a ZIP member name using the UTF-8 flag, Unicode Path extra field, or legacy Russian code pages.
+async function importCatalogPage(page){const message=document.querySelector('#remoteResult'),button=document.querySelector('#remotePlay');remoteBusy=true;button.disabled=true;message.textContent='Reading files from the catalog entry...';try{const files=await getCatalogPageFiles(page);let saved=0;for(const item of files){const response=await fetch('/catalog-link/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({url:item.url,name:item.name})});if(response.ok)saved++;else throw Error(await response.text())}await loadCatalogLinks(files[0].url);if(files.length===1){document.querySelector('#remoteUrl').value=files[0].url;onManualUrlInput(false);manualRemoteUrl=false;message.textContent='Catalog file found. Downloading...';await playRemote()}else message.textContent='Found '+files.length+' files ('+saved+' saved). Choose one in Saved catalog links, then press Download and run.'}catch(e){message.textContent='Could not read files from catalog page: '+e.message}finally{remoteBusy=false;button.disabled=false}}async function uploadAndPlay(blob,name){if(blob.size<5||blob.size>65539)throw Error('BIN file size must be 5 to 65539 bytes');if(!name.toLowerCase().endsWith('.bin'))name+='.bin';const data=new FormData();data.append('file',new File([blob],name,{type:'application/octet-stream'}));const uploaded=await fetch('/upload',{method:'POST',body:data}),uploadMessage=await uploaded.text();if(!uploaded.ok)throw Error(uploadMessage);await loadFiles(name);await persistSelections();await refreshStorage();const names=await(await fetch('/api/files')).json(),id=names.findIndex(n=>n.name.toLowerCase()===name.toLowerCase());if(id<0)throw Error('Uploaded file was not found in the list');await loadFiles(name);const selectedId=selectedFileServerId();const started=await fetch(await playbackUrl(selectedId));if(!started.ok)throw Error(await started.text());messageFor('Downloaded and playing: '+name);refresh()}function resizeRemoteUrl(){const input=document.querySelector('#remoteUrl');input.style.height='auto';input.style.height=Math.min(220,Math.max(42,input.scrollHeight))+'px'}function onManualUrlInput(manual=true){resizeRemoteUrl();manualRemoteUrl=manual;const original=document.querySelector('#remoteUrl').value.trim(),page=parseCatalogPageUrl(original);let value=unwrapCatalogInput(original).split(/[?#]/)[0];while(value.endsWith('/'))value=value.slice(0,-1);let name=page?(page.id?'Catalog item '+page.id:'Web page'):value.slice(value.lastIndexOf('/')+1);try{if(!page)name=decodeURIComponent(name)}catch(e){}manualLinkName=name;manualLinkUrl=original;const select=document.querySelector('#catalogFiles'),old=select.querySelector('option[value="manual"]');if(manual&&name){if(!old)select.add(new Option(name,'manual'));else old.textContent=name;select.value='manual'}else if(old){old.remove();if(select.value==='manual'&&select.options.length)select.value=select.options[0].value}renderCatalogPicker()}function messageFor(s){document.querySelector('#remoteResult').textContent=s}function zipEndOffset(bytes){const view=new DataView(bytes),start=Math.max(0,bytes.byteLength-65557);for(let i=bytes.byteLength-22;i>=start;i--)if(view.getUint32(i,true)===0x06054b50)return i;return -1}// Decodes a ZIP member name using the UTF-8 flag, Unicode Path extra field, or legacy Russian code pages.
 function decodeZipName(bytes,offset,length,flags,extraOffset,extraLength,view){const raw=new Uint8Array(bytes,offset,length),utf8=new TextDecoder('utf-8');if(flags&0x800)return utf8.decode(raw);let end=extraOffset+extraLength,at=extraOffset;while(at+4<=end){const id=view.getUint16(at,true),size=view.getUint16(at+2,true);at+=4;if(at+size>end)break;if(id===0x7075&&size>=5&&view.getUint8(at)===1){const nameBytes=new Uint8Array(bytes,at+5,size-5);try{return utf8.decode(nameBytes)}catch(e){}}at+=size}try{return new TextDecoder('utf-8',{fatal:true}).decode(raw)}catch(e){}
   // В старых ZIP кодировка не указана. Сравниваем всё имя:
   // байт E8, например, встречается и в DOS-866, и в Windows-1251.
@@ -383,7 +424,7 @@ function decodeZipName(bytes,offset,length,flags,extraOffset,extraLength,view){c
 function parseZip(bytes){const view=new DataView(bytes),eocd=zipEndOffset(bytes);if(eocd<0)throw Error('Could not read ZIP archive');if(view.getUint16(eocd+4,true)!==0||view.getUint16(eocd+6,true)!==0)throw Error('Multi-volume ZIP archives are not supported');const count=view.getUint16(eocd+10,true),centralSize=view.getUint32(eocd+12,true),centralOffset=view.getUint32(eocd+16,true);if(centralOffset+centralSize>eocd)throw Error('Corrupt ZIP archive');const entries=[];let hasNestedZip=false,at=centralOffset;for(let i=0;i<count;i++){if(at+46>bytes.byteLength||view.getUint32(at,true)!==0x02014b50)throw Error('Corrupt ZIP directory entry');const flags=view.getUint16(at+8,true),method=view.getUint16(at+10,true),compressed=view.getUint32(at+20,true),size=view.getUint32(at+24,true),nameLen=view.getUint16(at+28,true),extraLen=view.getUint16(at+30,true),commentLen=view.getUint16(at+32,true),local=view.getUint32(at+42,true),name=decodeZipName(bytes,at+46,nameLen,flags,at+46+nameLen,extraLen,view);const lower=name.toLowerCase();if(!name.endsWith('/')&&lower.endsWith('.zip'))hasNestedZip=true;if(!name.endsWith('/')&&lower.endsWith('.bin')){if(flags&1)throw Error('Encrypted BIN files in ZIP archives are not supported');if(method!==0&&method!==8)throw Error('Unsupported ZIP compression method: '+method);if(size>65539)throw Error(name+' exceeds the 64 KiB BIN limit');entries.push({name,method,compressed,size,local})}at+=46+nameLen+extraLen+commentLen}if(!entries.length)throw Error(hasNestedZip?'No BIN files found. Nested ZIP archives are not supported; this player can play BIN tape files only.':'No BIN files found in ZIP archive. This player can play BIN tape files only.');return entries}// Распаковывает ZIP-запись и проверяет размер и заголовок BIN до запуска.
 async function extractZipEntry(bytes,entry){const view=new DataView(bytes),at=entry.local;if(at+30>bytes.byteLength||view.getUint32(at,true)!==0x04034b50)throw Error('Corrupt local ZIP entry');const start=at+30+view.getUint16(at+26,true)+view.getUint16(at+28,true),end=start+entry.compressed;if(end>bytes.byteLength)throw Error('ZIP data is truncated');let result;if(entry.method===0)result=bytes.slice(start,end);else{if(!('DecompressionStream'in window))throw Error('This browser cannot decompress ZIP Deflate archives');const stream=new Blob([bytes.slice(start,end)]).stream().pipeThrough(new DecompressionStream('deflate-raw'));result=await new Response(stream).arrayBuffer()}if(result.byteLength!==entry.size)throw Error('Unpacked file size does not match the ZIP entry');const b=new Uint8Array(result),declared=b.length>=4?b[2]|(b[3]<<8):0;if(b.length<5||declared===0)throw Error('File does not contain a valid BIN payload');return new Blob([result],{type:'application/octet-stream'})}function cancelZip(){pendingZip=null;document.querySelector('#zipPicker').hidden=true}async function extractSelectedZip(){if(!pendingZip)return;const entry=pendingZip.entries[Number(document.querySelector('#zipMember').value)];if(!entry)return;try{document.querySelector('#extractZip').disabled=true;document.querySelector('#remoteResult').textContent='Extracting '+entry.name+'...';const bin=await extractZipEntry(pendingZip.bytes,entry);cancelZip();await uploadAndPlay(bin,entry.name.split('/').pop())}catch(e){document.querySelector('#remoteResult').textContent='Could not extract BIN: '+e.message}finally{document.querySelector('#extractZip').disabled=false}}async function saveManualCatalogLink(url){const item=catalogLinkData.find(x=>catalogRawUrl(x.url)===url);if(item)return;let name=url.split('?')[0].split('/').pop();try{name=decodeURIComponent(name)}catch(e){}try{const response=await fetch('/catalog-link/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({url,name})});if(response.ok)await loadCatalogLinks(url)}catch(e){}}async function playRemote(){const message=document.querySelector('#remoteResult'),inputUrl=unwrapCatalogInput(document.querySelector('#remoteUrl').value),catalogPage=parseCatalogPageUrl(inputUrl);if(catalogPage){await importCatalogPage(catalogPage);return}let url=catalogRawUrl(inputUrl);if(!/^https?:\/\//i.test(url)){message.textContent='Enter a valid HTTP/HTTPS link';return}const path=url.toLowerCase().split(/[?#]/)[0];if(!path.endsWith('.bin')&&!path.endsWith('.zip')){message.textContent='This link is not a page or a BIN/ZIP file';return}remoteBusy=true;pendingZip=null;document.querySelector('#zipPicker').hidden=true;document.querySelector('#remotePlay').disabled=true;message.textContent='Downloading from catalog...';try{const response=await fetch(url);if(!response.ok)throw Error('HTTP '+response.status);const blob=await response.blob();await saveManualCatalogLink(url);if(path.endsWith('.bin')){const item=catalogLinkData[Number(document.querySelector('#catalogFiles').value)],linkedUrl=item?catalogRawUrl(item.url):'';let name=!manualRemoteUrl&&item&&linkedUrl===url&&item.name.toLowerCase().endsWith('.bin')?item.name:decodeURIComponent(url.split('?')[0].split('/').pop());await uploadAndPlay(blob,name)}else{if(blob.size>8*1024*1024)throw Error('ZIP archive exceeds 8 MiB browser limit');const bytes=await blob.arrayBuffer(),entries=parseZip(bytes),select=document.querySelector('#zipMember');if(entries.length===1){const bin=await extractZipEntry(bytes,entries[0]);await uploadAndPlay(bin,entries[0].name.split('/').pop())}else{pendingZip={bytes,entries};select.replaceChildren();entries.forEach((x,i)=>select.add(new Option(x.name,i)));document.querySelector('#zipPicker').hidden=false;message.textContent='Archive contains '+entries.length+' BIN files. Choose one to play.'}}}catch(e){message.textContent='Could not download or extract the file: '+e.message}finally{remoteBusy=false;document.querySelector('#remotePlay').disabled=false}}function cmd(u){fetch(u).then(refresh).catch(refresh)}function fmt(s){return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}// Проверяет локальный файл и показывает результат его загрузки во flash.
 async function uploadBin(){let f=document.querySelector('#bin').files[0];if(!f)return;let m=document.querySelector('#uploadResult');if(!f.name.toLowerCase().endsWith('.bin')){m.textContent='File must have .bin extension';document.querySelector('#bin').value='';return}if(f.size<5||f.size>65539){m.textContent='Invalid BIN file size';document.querySelector('#bin').value='';return}m.textContent='Uploading...';let d=new FormData();d.append('file',f);try{let r=await fetch('/upload',{method:'POST',body:d}),t=await r.text();m.textContent=t;if(r.ok){await loadFiles(f.name);await persistSelections();document.querySelector('#bin').value='';refreshStorage()}}catch(e){m.textContent='BIN upload failed'}}async function refreshStorage(){try{let s=await(await fetch('/api/storage',{cache:'no-store'})).json();document.querySelector('#storage').textContent='Flash storage: '+(s.free/1024).toFixed(0)+' kB free of '+(s.total/1024).toFixed(0)+' kB'}catch(e){document.querySelector('#storage').textContent='Flash storage unavailable'}}let wifiPromptShown=false;function openWifiDialog(){const dialog=document.querySelector('#wifiDialog');if(!dialog.open)dialog.showModal()}function closeWifiDialog(){document.querySelector('#wifiDialog').close()}async function connectWifi(){const message=document.querySelector('#wifiMessage'),ssid=document.querySelector('#wifiSsid').value.trim(),passwordField=document.querySelector('#wifiPassword'),password=passwordField.value;if(!ssid){message.textContent='Enter the network name (SSID).';return}message.textContent='Connecting...';try{const response=await fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({ssid,password})});message.textContent=await response.text()}catch(e){message.textContent='Could not send Wi-Fi settings.'}finally{passwordField.value=''}}async function skipWifiSetup(){await fetch('/wifi/skip',{method:'POST'});closeWifiDialog()}// Обновляет статус плеера и SSID; диалог настроек закрывает только пользователь.
-async function refresh(){try{let s=await(await fetch('/api/status',{cache:'no-store'})).json();const warning=document.querySelector('#lengthWarning');
+async function refresh(){try{let s=await(await fetch('/api/status',{cache:'no-store'})).json();if(menuRevisionSeen>=0 && s.menu_revision!==menuRevisionSeen){await pendingSetting;applySavedControls(await(await fetch('/api/selection')).json());await loadAudioLevel();await loadFiles(file.selectedOptions[0]?.textContent||'')}const warning=document.querySelector('#lengthWarning');
 warning.textContent=s.lengthWarning;
 warning.hidden=!s.lengthWarning;
 document.querySelector('#currentWifi').textContent='Current network: '+(s.current_network||'Not connected');if(s.wifi_connected&&!document.querySelector('#wifiSsid').value)document.querySelector('#wifiSsid').value=s.ssid;activeBinName=s.playing ? s.file : '';
@@ -391,31 +432,67 @@ activeRemainingSeconds=s.remaining_seconds;
 activeBinPercent=Math.min(100,Math.max(0,Number(s.percent)||0));
 updateFileProgress();
 status.textContent='Wi-Fi: '+s.wifi+' | '+s.ip+' | Speed: '+Number(s.speed).toFixed(1).replace('.',',')+'×';
-document.querySelector('#play').disabled=s.playing;document.querySelector('#stop').disabled=!s.playing;document.querySelector('#bin').disabled=s.playing;document.querySelector('#remotePlay').disabled=s.playing||remoteBusy;document.querySelector('#linksText').disabled=s.playing;document.querySelector('#delete').disabled=s.playing||!file.selectedOptions[0];if(s.wifi_setup_required&&!wifiPromptShown){wifiPromptShown=true;openWifiDialog()}}catch(e){status.textContent='Player is unreachable'}}async function initializePlayer(){let saved={file:'',catalog:''};try{saved=await(await fetch('/api/selection')).json()}catch(e){}await loadFiles(saved.file||'');await loadCatalogLinks(saved.catalog||'');refreshStorage()}initializePlayer();loadAudioLevel();setInterval(refresh,1000);setInterval(refreshStorage,10000);refresh();
+document.querySelector('#play').disabled=s.playing;document.querySelector('#stop').disabled=!s.playing;document.querySelector('#bin').disabled=s.playing;document.querySelector('#remotePlay').disabled=s.playing||remoteBusy;document.querySelector('#linksText').disabled=s.playing;document.querySelector('#delete').disabled=s.playing||!file.selectedOptions[0];if(s.wifi_setup_required&&!wifiPromptShown){wifiPromptShown=true;openWifiDialog()}}catch(e){status.textContent='Player is unreachable'}}async function initializePlayer(){let saved={file:'',catalog:''};try{saved=await(await fetch('/api/selection')).json()}catch(e){}if(saved.speed)applySavedControls(saved);await loadFiles(saved.file||'');await loadCatalogLinks(saved.catalog||'');refreshStorage()}initializePlayer();loadAudioLevel();setInterval(refresh,1000);setInterval(refreshStorage,10000);refresh();
 </script></html>)HTML";
+
+int menuValue(MenuItem item) {
+  switch (item) {
+    case MenuItem::Speed: return int(savedSpeed * 2);
+    case MenuItem::Level: return audioLevel;
+    case MenuItem::Replace: return replaceTapeName;
+    case MenuItem::Upper: return upperTapeName;
+  }
+  return 0;
+}
+
+void drawMenu() {
+  display.drawStr(5, 10, menuEditing ? "2 Save     4 Exit" : "2 Edit     4 Exit");
+  display.drawHLine(4, 13, 120);
+  for (int i = 0; i < 4; ++i) {
+    const MenuItem item = static_cast<MenuItem>(i);
+    const bool selected = item == menuItem;
+    const int value = selected && menuEditing ? menuDraft : menuValue(item);
+    const int y = 25 + i * 12;
+    const char *labels[] = {"Speed", "Level", "Replace name", "UPPERCASE"};
+    display.drawStr(4, y, selected ? (menuEditing ? "*" : ">") : " ");
+    display.drawStr(12, y, labels[i]);
+    String text;
+    if (item == MenuItem::Speed) text = String(value * 0.5f, 1) + "x";
+    else if (item == MenuItem::Level) text = String(value) + "%";
+    else text = value ? "ON" : "OFF";
+    display.drawStr(121 - display.getStrWidth(text.c_str()), y, text.c_str());
+  }
+}
 
 // Обновляет OLED: режим воспроизведения, имя BIN, скорость, сеть/IP и прогресс.
 void drawScreen() {
   display.clearBuffer();
   display.drawFrame(0, 0, 128, 64);
   display.setFont(u8g2_font_5x8_tf);
-  display.drawStr(6, 11, "BK TAPE PLAYER");
+  if (menuOpen && !isPlaying) {
+    drawMenu();
+    display.sendBuffer();
+    return;
+  }
+  char heading[32];
+  snprintf(heading, sizeof(heading), "%s  %u/%u", isPlaying ? "PLAY" : "FILE",
+           unsigned(localBins.empty() ? 0 : selectedBin + 1), unsigned(localBins.size()));
+  display.drawStr(6, 11, heading);
   display.drawHLine(5, 14, 118);
-  display.drawStr(6, 26, currentName);
-  char playbackLine[16];
-  snprintf(playbackLine, sizeof(playbackLine), "%s %u,%ux", isPlaying ? "PLAY" : "STOP", unsigned(playbackSpeed), unsigned(playbackSpeed * 10) % 10);
-  display.drawStr(6, 36, playbackLine);
-  drawProgressLine();
+  display.setFont(u8g2_font_6x13_t_cyrillic);
+  display.setClipWindow(5, 15, 123, 32);
+  display.drawUTF8(6, 28, isPlaying ? currentName : localBins.empty() ? "..." : localBins[selectedBin].name.c_str());
+  display.setMaxClipWindow();
+  display.setFont(u8g2_font_5x8_tf);
+  if (isPlaying) drawProgressLine();
+  else {
+    char line[32];
+    snprintf(line, sizeof(line), "%.1fx   Level %u%%", savedSpeed, unsigned(audioLevel));
+    display.drawStr(6, 43, buttonPlayFailed ? "Cannot play file" : line);
+  }
   const bool connected = WiFi.status() == WL_CONNECTED;
   String networkLine = connected ? "WIFI " + WiFi.localIP().toString() : wifiApActive ? "AP 192.168.4.1" : "WIFI ...";
-  if (display.getStrWidth(networkLine.c_str()) <= 116) {
-    display.drawStr(6, 57, networkLine.c_str());
-  } else {
-    display.drawStr(6, 51, "WIFI IP");
-    display.setFont(u8g2_font_4x6_tf);
-    String ipLine = "IP " + WiFi.localIP().toString();
-    display.drawStr(6, 61, ipLine.c_str());
-  }
+  display.drawStr(6, 61, networkLine.c_str());
   display.sendBuffer();
 }
 
@@ -428,6 +505,7 @@ bool beginPlayback(const char *name, const uint8_t *data, size_t size, bool inFl
   const uint16_t actualLength = size - 4;
   const uint16_t declared = min(headerLength, actualLength);
   if (!declared) return false;
+  menuOpen = menuEditing = false;
   lengthWarning = "";
   if (actualLength != headerLength) {
     lengthWarning = String("Предупреждение: в заголовке BIN ") + headerLength +
@@ -627,6 +705,37 @@ bool startSelectedFile(int index, float speed, const char *overrideName = "", bo
   return true;
 }
 
+// Сохраняем исходный индекс LittleFS до сортировки: именно его ожидает
+// startSelectedFile(). Обход каталога нужен только после изменений.
+void refreshLocalBins() {
+  if (!localBinsDirty) return;
+  localBins.clear();
+  localBins.push_back({SYSTEM_BIN_NAME, SYSTEM_BIN_ID});
+  if (filesystemReady) {
+    File root = LittleFS.open("/");
+    int id = 0;
+    for (File item = root.openNextFile(); item; item = root.openNextFile()) {
+      if (!item.isDirectory() && hasBinExtension(item.name()))
+        localBins.push_back({basenameOf(item.name()), id++});
+      item.close();
+    }
+  }
+  std::sort(localBins.begin(), localBins.end(), [](const LocalBin &a, const LocalBin &b) {
+    return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+  });
+  selectedBin = 0;
+  for (size_t i = 0; i < localBins.size(); ++i)
+    if (localBins[i].name == lastSelectedFile) { selectedBin = i; break; }
+  localBinsDirty = false;
+  buttonPlayFailed = false;
+}
+
+void rememberSpeed(float speed) {
+  if (speed == savedSpeed) return;
+  savedSpeed = speed;
+  settings.putUChar("speed_half", uint8_t(speed * 2));
+}
+
 // Проверяет параметры HTTP-запроса и начинает передачу выбранного файла.
 // Принимаем пять значений скорости, включая целые из ранее открытых страниц.
 float requestedPlaybackSpeed(float defaultSpeed) {
@@ -643,11 +752,18 @@ float requestedPlaybackSpeed(float defaultSpeed) {
 void handlePlay() {
   if (!server.hasArg("id")) { server.send(400, "text/plain", "missing id"); return; }
   const int id = server.arg("id").toInt();
-  const float speed = requestedPlaybackSpeed(1.0f);
+  const float speed = requestedPlaybackSpeed(savedSpeed);
   if (speed < 1 || speed > 3) { server.send(400, "text/plain", "speed must be 1.0..3.0 in steps of 0.5"); return; }
-  String overrideName = server.arg("name");
+  String overrideName = server.hasArg("name") ? server.arg("name") : (replaceTapeName ? replacementName : String());
   overrideName.trim();
-  if (!startSelectedFile(id, speed, overrideName.c_str(), server.arg("upper") == "1")) { server.send(409, "text/plain", "cannot start playback"); return; }
+  const bool uppercase = server.hasArg("upper") ? server.arg("upper") == "1" : upperTapeName;
+  if (!startSelectedFile(id, speed, overrideName.c_str(), uppercase)) { server.send(409, "text/plain", "cannot start playback"); return; }
+  rememberSpeed(speed);
+  if (lastSelectedFile != currentName) {
+    lastSelectedFile = currentName;
+    settings.putString("last_file", lastSelectedFile);
+    localBinsDirty = true;
+  }
   server.send(200, "text/plain", "playing");
 }
 
@@ -669,6 +785,76 @@ void stopPlaybackImmediately() {
   activeData = nullptr;
   activeDataInFlash = true;
   drawScreen();
+}
+
+// Черновик живёт до подтверждения кнопкой 2. Выход кнопкой 4 отменяет его.
+void handleMenuButton(size_t button) {
+  if (button == 1) {
+    if (menuEditing) {
+      switch (menuItem) {
+        case MenuItem::Speed: rememberSpeed(menuDraft * 0.5f); break;
+        case MenuItem::Level:
+          audioLevel = menuDraft;
+          settings.putUChar("audio_level", audioLevel);
+          break;
+        case MenuItem::Replace:
+          replaceTapeName = menuDraft;
+          settings.putBool("replace_name", replaceTapeName);
+          break;
+        case MenuItem::Upper:
+          upperTapeName = menuDraft;
+          settings.putBool("upper_name", upperTapeName);
+          break;
+      }
+      ++menuRevision;
+    } else menuDraft = menuValue(menuItem);
+    menuEditing = !menuEditing;
+    return;
+  }
+  const int direction = button == 0 ? -1 : 1;
+  if (!menuEditing) menuItem = static_cast<MenuItem>((int(menuItem) + direction + 4) % 4);
+  else if (menuItem == MenuItem::Speed) menuDraft = constrain(menuDraft + direction, 2, 6);
+  else if (menuItem == MenuItem::Level) menuDraft = constrain(menuDraft + direction * 5, 0, 100);
+  else menuDraft = direction > 0;
+}
+
+// Первое нажатие листает сразу. При удержании повторяем только навигацию.
+void pollButtons() {
+  for (size_t i = 0; i < 4; ++i) {
+    GButton &b = buttons[i];
+    b.tick();
+    const bool pressed = b.isPress();
+    const bool repeat = (i == 0 || i == 2) && (b.isHolded() || b.isStep(b.getHoldClicks()));
+    if (!pressed && !repeat) continue;
+    if (i == 3) {
+      if (!isPlaying) {
+        menuOpen = !menuOpen;
+        menuEditing = false;
+        menuItem = MenuItem::Speed;
+        drawScreen();
+      }
+      continue;
+    }
+    if (menuOpen) { handleMenuButton(i); drawScreen(); continue; }
+    if (i == 1 && isPlaying) { stopPlaybackImmediately(); continue; }
+    if (isPlaying || localBins.empty()) continue;
+    if (i == 1) {
+      buttonPlayFailed = !startSelectedFile(localBins[selectedBin].id, savedSpeed,
+                                            replaceTapeName ? replacementName.c_str() : "", upperTapeName);
+    } else {
+      selectedBin = (selectedBin + (i == 0 ? localBins.size() - 1 : 1)) % localBins.size();
+      buttonPlayFailed = false;
+      if (lastSelectedFile != localBins[selectedBin].name) {
+        lastSelectedFile = localBins[selectedBin].name;
+      }
+    }
+    drawScreen();
+  }
+  // При прокрутке сохраняем конечный выбор после отпускания, чтобы каждый
+  // повтор не приводил к записи во флеш-память.
+  if ((buttons[0].isRelease() || buttons[2].isRelease()) &&
+      settings.getString("last_file", "") != lastSelectedFile)
+    settings.putString("last_file", lastSelectedFile);
 }
 
 // Маркер .keep означает, что файл нельзя удалять ради освобождения места.
@@ -699,7 +885,8 @@ bool removeOldestUnprotected(const String &exceptPath) {
   }
   root.close();
   if (oldestPath.isEmpty()) return false;
-  LittleFS.remove(oldestPath);
+  if (!LittleFS.remove(oldestPath)) return false;
+  localBinsDirty = true;
   LittleFS.remove(oldestPath + ".keep");
   return true;
 }
@@ -764,6 +951,7 @@ void handleUploadData() {
       uploadAccepted = false; uploadResultCode = 422; uploadResultMessage = "Invalid BIN header or truncated payload";
       LittleFS.remove(uploadTempPath); return;
     }
+    localBinsDirty = true;
     if (LittleFS.exists(uploadPath)) LittleFS.remove(uploadPath);
     if (!LittleFS.rename(uploadTempPath, uploadPath)) {
       uploadAccepted = false; uploadResultCode = 507; uploadResultMessage = "Could not save BIN to flash";
@@ -1112,6 +1300,7 @@ void handleDelete() {
   }
   if (!LittleFS.remove(path)) { server.send(500, "text/plain", "delete failed"); return; }
   LittleFS.remove(path + ".keep");
+  localBinsDirty = true;
   server.send(200, "text/plain", "BIN deleted");
 }
 
@@ -1144,7 +1333,12 @@ void handleProtect() {
 
 // Отдаёт сохранённые в NVS выборы BIN-файла и ссылки каталога.
 void sendSavedSelection() {
-  String body = "{\"file\":\"" + jsonEscape(lastSelectedFile.c_str()) +
+  String body = "{\"speed\":" + String(savedSpeed, 1) +
+                ",\"replace\":" + (replaceTapeName ? "true" : "false") +
+                ",\"upper\":" + (upperTapeName ? "true" : "false") +
+                ",\"name\":\"" + jsonEscape(replacementName.c_str()) +
+                "\",\"menu_revision\":" + String(menuRevision) +
+                ",\"file\":\"" + jsonEscape(lastSelectedFile.c_str()) +
                 "\",\"catalog\":\"" + jsonEscape(lastSelectedCatalog.c_str()) + "\"}";
   server.send(200, "application/json; charset=utf-8", body);
 }
@@ -1152,7 +1346,32 @@ void sendSavedSelection() {
 // Сохраняет выбранный BIN и выбранную ссылку каталога в NVS для восстановления
 // интерфейса после перезапуска платы.
 void saveSelection() {
-  if (server.hasArg("file")) {
+  if (server.hasArg("tape_name")) {
+    String name = server.arg("tape_name");
+    name.trim();
+    if (name.length() > 64) { server.send(400, "text/plain", "Tape name too long"); return; }
+    for (size_t i = 0; i < name.length(); ++i)
+      if (uint8_t(name[i]) < 32) { server.send(400, "text/plain", "Invalid tape name"); return; }
+    if (name != replacementName) {
+      replacementName = name;
+      settings.putString("tape_name", replacementName);
+    }
+  }
+  if (server.hasArg("replace")) {
+    replaceTapeName = server.arg("replace") == "1";
+    settings.putBool("replace_name", replaceTapeName);
+  }
+  if (server.hasArg("upper")) {
+    upperTapeName = server.arg("upper") == "1";
+    settings.putBool("upper_name", upperTapeName);
+  }
+  if (server.hasArg("speed")) {
+    float speed = requestedPlaybackSpeed(savedSpeed);
+    if (!speed) { server.send(400, "text/plain", "invalid speed"); return; }
+    rememberSpeed(speed);
+  }
+  if (server.hasArg("file") && server.arg("file") != lastSelectedFile) {
+    localBinsDirty = true;
     lastSelectedFile = server.arg("file");
     settings.putString("last_file", lastSelectedFile);
   }
@@ -1241,6 +1460,11 @@ void setupWeb() {
 // Инициализирует GPIO, OLED, LittleFS, таймер, Wi-Fi/AP и HTTP-сервер.
 void setup() {
   Serial.begin(115200);
+  for (GButton &b : buttons) {
+    b.setDebounce(30);
+    b.setTimeout(500);
+    b.setStepTimeout(180);
+  }
   pinMode(AUDIO_PIN, OUTPUT);
   digitalWrite(AUDIO_PIN, LOW);
   display.setI2CAddress(0x3C << 1);
@@ -1267,6 +1491,12 @@ void setup() {
   lastSelectedFile = settings.getString("last_file", "");
   lastSelectedCatalog = settings.getString("last_catalog", "");
   audioLevel = settings.getUChar("audio_level", 100);
+  const uint8_t halfSteps = settings.getUChar("speed_half", 2);
+  savedSpeed = halfSteps >= 2 && halfSteps <= 6 ? halfSteps * 0.5f : 1.0f;
+  replacementName = settings.getString("tape_name", "V");
+  replaceTapeName = settings.getBool("replace_name", false);
+  upperTapeName = settings.getBool("upper_name", false);
+  refreshLocalBins();
   const bool wifiSkipped = settings.getBool("wifi_skip", false);
   WiFi.persistent(false);
   esp_wifi_restore();
@@ -1321,6 +1551,8 @@ void loop() {
   }
   if (wifiApActive) dnsServer.processNextRequest();
   server.handleClient();
+  refreshLocalBins();
+  pollButtons();
   const wl_status_t wifi = WiFi.status();
   if (wifiConnectPending) {
     if (wifi == WL_CONNECTED) {
